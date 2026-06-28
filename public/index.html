@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Project Control Panel</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Project Control Panel</h1>
+    <div class="header-actions">
+      <button id="newBtn" class="btn primary">+ New project</button>
+      <label class="toggle">
+        <input type="checkbox" id="showArchived" />
+        Show archived
+      </label>
+      <button id="themeBtn" class="btn" title="Toggle light / dark theme" aria-label="Toggle theme">🌙</button>
+    </div>
+  </header>
+
+  <main id="board" class="board"></main>
+
+  <p id="empty" class="empty" hidden>No projects yet. Click <b>+ New project</b> to add one.</p>
+
+  <!-- New project dialog -->
+  <dialog id="newDialog">
+    <form method="dialog" id="newForm">
+      <h2>New project</h2>
+      <label>Name<input name="name" required maxlength="120" autocomplete="off" /></label>
+      <label>Start date<input name="start_date" type="date" /></label>
+      <label>Status
+        <select name="status">
+          <option>Planning</option>
+          <option>Active</option>
+          <option>On hold</option>
+          <option>Done</option>
+        </select>
+      </label>
+      <label>Description<textarea name="description" rows="2" maxlength="500"></textarea></label>
+      <menu>
+        <button value="cancel" class="btn">Cancel</button>
+        <button value="create" class="btn primary" id="createBtn">Create</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
