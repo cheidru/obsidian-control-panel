@@ -10,7 +10,10 @@ const DEFAULT_VAULT_PATH = 'C:\\Users\\chei\\ObsidianVault';
 const PROJECTS_DIRNAME = 'control panel';
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 const ARCHIVE_DIRNAME = '_archive';
-const META_FILENAME = 'project.md';
+// Each project's metadata lives in "<folder>_info.md" inside its folder.
+// Older projects used a fixed "project.md"; those are migrated on access.
+const LEGACY_META_FILENAME = 'project.md';
+const metaFilename = (folder) => `${folder}_info.md`;
 const PORT = process.env.PORT || 4321;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
@@ -137,6 +140,115 @@ public class PanelWindow : IWin32Window {
   });
 }
 
+// Opens an obsidian:// URI and moves the Obsidian window over the panel window
+// (same position and size), raised to the front. Fire-and-forget: repositioning
+// polls for Obsidian's window for a few seconds, so we don't await it.
+function openNoteInObsidian(uri, noteBase) {
+  if (process.platform !== 'win32') {
+    exec(`xdg-open "${uri}" || open "${uri}"`, () => {});
+    return;
+  }
+  const u = String(uri).replace(/'/g, "''");
+  const prefer = String(noteBase || '').replace(/'/g, "''");
+  const title = PANEL_WINDOW_TITLE.replace(/'/g, "''");
+
+  const winType = `
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+public class WinCtl {
+  public struct RECT { public int Left, Top, Right, Bottom; }
+  delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+  [DllImport("user32.dll")] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+  [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+
+  static readonly IntPtr TOPMOST = new IntPtr(-1);
+  static readonly IntPtr NOTOPMOST = new IntPtr(-2);
+  const uint SWP_SHOW = 0x0040;
+  const uint SWP_NOSIZE = 0x0001;
+
+  public static IntPtr FindByTitle(string part) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows(delegate(IntPtr h, IntPtr l) {
+      if (!IsWindowVisible(h)) return true;
+      StringBuilder sb = new StringBuilder(512); GetWindowText(h, sb, 512);
+      if (sb.ToString().IndexOf(part, StringComparison.OrdinalIgnoreCase) >= 0) { found = h; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
+
+  // First visible window owned by one of the given PIDs (Obsidian is Electron,
+  // so it spawns several processes); prefer one whose title names the note.
+  public static IntPtr FindByPids(int[] pids, string prefer) {
+    IntPtr best = IntPtr.Zero, pref = IntPtr.Zero;
+    EnumWindows(delegate(IntPtr h, IntPtr l) {
+      if (!IsWindowVisible(h)) return true;
+      uint pid; GetWindowThreadProcessId(h, out pid);
+      bool m = false; foreach (int p in pids) { if ((uint)p == pid) { m = true; break; } }
+      if (!m) return true;
+      StringBuilder sb = new StringBuilder(512); GetWindowText(h, sb, 512);
+      if (sb.Length == 0) return true;
+      if (best == IntPtr.Zero) best = h;
+      if (prefer.Length > 0 && sb.ToString().IndexOf(prefer, StringComparison.OrdinalIgnoreCase) >= 0) { pref = h; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return pref != IntPtr.Zero ? pref : best;
+  }
+
+  // Move Obsidian to the panel's top-left and raise it to the front, WITHOUT
+  // resizing (SWP_NOSIZE) — forcing a size fights Obsidian's own layout on load.
+  public static void Place(IntPtr h, int x, int y) {
+    ShowWindow(h, 9); // SW_RESTORE (un-minimise)
+    // Topmost toggle raises it above the panel without needing foreground rights.
+    SetWindowPos(h, TOPMOST, x, y, 0, 0, SWP_SHOW | SWP_NOSIZE);
+    SetWindowPos(h, NOTOPMOST, x, y, 0, 0, SWP_SHOW | SWP_NOSIZE);
+    SetForegroundWindow(h);
+  }
+}
+`.trim();
+
+  const script = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    "Add-Type -TypeDefinition @'",
+    winType,
+    "'@",
+    // Capture the panel window's rectangle before launching Obsidian steals focus.
+    `$panel = [WinCtl]::FindByTitle('${title}')`,
+    'if ($panel -eq [IntPtr]::Zero) { $panel = [WinCtl]::GetForegroundWindow() }',
+    '$r = New-Object WinCtl+RECT',
+    '[void][WinCtl]::GetWindowRect($panel, [ref]$r)',
+    '$x = $r.Left; $y = $r.Top',
+    `Start-Process '${u}'`,
+    // Wait for the Obsidian window (cold start can take a few seconds).
+    '$obs = [IntPtr]::Zero',
+    '$deadline = (Get-Date).AddSeconds(12)',
+    'while ((Get-Date) -lt $deadline -and $obs -eq [IntPtr]::Zero) {',
+    '  Start-Sleep -Milliseconds 300',
+    '  $ids = @()',
+    '  try { $ids = @(Get-Process -Name Obsidian -ErrorAction Stop | ForEach-Object { $_.Id }) } catch {}',
+    `  if ($ids.Count -gt 0) { $obs = [WinCtl]::FindByPids($ids, '${prefer}') }`,
+    '}',
+    'if ($obs -ne [IntPtr]::Zero) { [WinCtl]::Place($obs, $x, $y) }',
+  ].join('\n');
+
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  execFile(
+    'powershell.exe',
+    ['-NoProfile', '-STA', '-EncodedCommand', encoded],
+    { timeout: 30000 },
+    (err) => { if (err) console.error('open note in Obsidian:', err.message); }
+  );
+}
+
 // --- Minimal YAML frontmatter parsing --------------------------------------
 function parseFrontmatter(content) {
   const data = {};
@@ -196,7 +308,20 @@ function sanitizeFolderName(name) {
 
 function metaPath(folder, archived) {
   const base = archived ? path.join(getRoot(), ARCHIVE_DIRNAME) : getRoot();
-  return path.join(base, folder, META_FILENAME);
+  const dir = path.join(base, folder);
+  const target = path.join(dir, metaFilename(folder));
+  // Migrate a legacy project.md to the new per-project name on first access.
+  if (!fs.existsSync(target)) {
+    const legacy = path.join(dir, LEGACY_META_FILENAME);
+    if (fs.existsSync(legacy)) {
+      try {
+        fs.renameSync(legacy, target);
+      } catch (e) {
+        return legacy; // rename failed: keep reading/writing the old file
+      }
+    }
+  }
+  return target;
 }
 
 function readProject(folder, archived) {
@@ -431,6 +556,23 @@ async function handleApi(req, res, parts) {
       if (!fs.existsSync(dir)) return sendJSON(res, 404, { error: 'Folder not found' });
       exec(`explorer "${dir}"`, () => {});
       return sendJSON(res, 200, { ok: true });
+    }
+
+    // Open the project's main note "<folder>.md" in Obsidian, raising Obsidian
+    // over the panel window. The note is created with a heading if missing.
+    if (req.method === 'POST' && action === 'note') {
+      const base = archived ? path.join(getRoot(), ARCHIVE_DIRNAME) : getRoot();
+      const dir = path.join(base, folder);
+      if (!fs.existsSync(dir)) return sendJSON(res, 404, { error: 'Folder not found' });
+      const file = path.join(dir, `${folder}.md`);
+      if (!fs.existsSync(file)) {
+        fs.writeFileSync(file, `# ${readProject(folder, archived).name}\n`);
+      }
+      // "path" targets the file by absolute path, so Obsidian opens it in
+      // whichever registered vault contains it — no vault name needed.
+      const uri = 'obsidian://open?path=' + encodeURIComponent(file);
+      openNoteInObsidian(uri, folder);
+      return sendJSON(res, 200, { ok: true, file, uri });
     }
   }
 

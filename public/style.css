@@ -151,7 +151,9 @@ dialog .field input:focus { outline: none; }
   gap: 12px;
   transition: border-color .15s, transform .15s;
 }
+.card { cursor: pointer; }
 .card:hover { border-color: #3a4757; }
+.card:hover .card-title { text-decoration: underline; }
 .card.archived { opacity: .72; }
 
 .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }

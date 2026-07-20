@@ -109,6 +109,19 @@ function card(p) {
   el.querySelector('.card-date').textContent = fmtDate(p.start_date);
   el.querySelector('.desc').textContent = p.description || '';
 
+  // Clicking the card box (anywhere outside its interactive controls) opens the
+  // project's main note "<folder>.md" in its default app.
+  el.title = 'Open note';
+  el.addEventListener('click', async (e) => {
+    if (e.target.closest('button, select, input, textarea, .desc')) return;
+    try {
+      await api('POST', `/api/project/${encodeURIComponent(p.folder)}/note?archived=${p.archived ? 1 : 0}`);
+      toast('Opening in Obsidian…');
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+
   // status change
   const statusSel = el.querySelector('.badge');
   statusSel.addEventListener('change', () => {
