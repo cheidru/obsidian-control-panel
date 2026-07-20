@@ -1,5 +1,4 @@
-# Obsidian Control Panel
-
+# [Obsidian Control Panel](https://cheidru.github.io/obsidian-control-panel/)
 A small local web interface to track projects stored as subfolders in your
 Obsidian vault. Each project shows its name, start date, percent complete,
 status, and a short description.
