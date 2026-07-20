@@ -9,6 +9,13 @@ const newForm = document.getElementById('newForm');
 const toastEl = document.getElementById('toast');
 
 const themeBtn = document.getElementById('themeBtn');
+const settingsBtn = document.getElementById('settingsBtn');
+const settingsMenu = document.getElementById('settingsMenu');
+const vaultPathItem = document.getElementById('vaultPathItem');
+const vaultDialog = document.getElementById('vaultDialog');
+const vaultForm = document.getElementById('vaultForm');
+const projectsDirHint = document.getElementById('projectsDirHint');
+const browseBtn = document.getElementById('browseBtn');
 
 let state = { active: [], archived: [] };
 const STATUSES = ['Planning', 'Active', 'On hold', 'Done'];
@@ -220,6 +227,88 @@ async function load() {
     toast(e.message, true);
   }
 }
+
+// --- settings menu ---------------------------------------------------------
+let settings = { vaultPath: '', projectsDir: '', projectsDirname: '', locked: false };
+
+function openMenu(open) {
+  settingsMenu.hidden = !open;
+  settingsBtn.setAttribute('aria-expanded', String(open));
+}
+
+settingsBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  openMenu(settingsMenu.hidden);
+});
+
+document.addEventListener('click', (e) => {
+  if (!settingsMenu.hidden && !settingsMenu.contains(e.target)) openMenu(false);
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !settingsMenu.hidden) openMenu(false);
+});
+
+function updateProjectsHint(vault) {
+  const base = (vault || '').trim().replace(/[\\/]+$/, '');
+  const sep = base.includes('/') && !base.includes('\\') ? '/' : '\\';
+  projectsDirHint.textContent = base
+    ? base + sep + settings.projectsDirname
+    : settings.projectsDir;
+}
+
+vaultPathItem.addEventListener('click', async () => {
+  openMenu(false);
+  try {
+    settings = await api('GET', '/api/settings');
+  } catch (e) {
+    return toast(e.message, true);
+  }
+  const input = vaultForm.querySelector('[name=vaultPath]');
+  input.value = settings.vaultPath;
+  input.disabled = settings.locked;
+  browseBtn.disabled = settings.locked;
+  document.getElementById('vaultSaveBtn').disabled = settings.locked;
+  updateProjectsHint(settings.vaultPath);
+  vaultDialog.showModal();
+  input.focus();
+  input.select();
+});
+
+vaultForm.querySelector('[name=vaultPath]').addEventListener('input', (e) => {
+  updateProjectsHint(e.target.value);
+});
+
+// Opens the native Windows folder dialog on the machine running the server.
+browseBtn.addEventListener('click', async () => {
+  const input = vaultForm.querySelector('[name=vaultPath]');
+  browseBtn.disabled = true;
+  try {
+    const res = await api('POST', '/api/browse-folder', { initialPath: input.value });
+    if (res.cancelled) return;
+    input.value = res.path;
+    updateProjectsHint(res.path);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    browseBtn.disabled = false;
+    input.focus();
+  }
+});
+
+vaultForm.addEventListener('submit', async (e) => {
+  if (e.submitter && e.submitter.value === 'cancel') return;
+  e.preventDefault();
+  const next = new FormData(vaultForm).get('vaultPath');
+  try {
+    settings = await api('PUT', '/api/settings', { vaultPath: next });
+    vaultDialog.close();
+    toast('Vault path saved');
+    load();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
 
 // --- events ----------------------------------------------------------------
 newBtn.addEventListener('click', () => {

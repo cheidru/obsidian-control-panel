@@ -16,6 +16,15 @@
         Show archived
       </label>
       <button id="themeBtn" class="btn" title="Toggle light / dark theme" aria-label="Toggle theme">🌙</button>
+      <div class="menu-wrap">
+        <button id="settingsBtn" class="btn" title="Settings" aria-label="Settings"
+                aria-haspopup="true" aria-expanded="false" aria-controls="settingsMenu">⚙️</button>
+        <ul id="settingsMenu" class="menu" role="menu" hidden>
+          <li role="none">
+            <button type="button" role="menuitem" id="vaultPathItem">Obsidian Vault Path</button>
+          </li>
+        </ul>
+      </div>
     </div>
   </header>
 
@@ -41,6 +50,25 @@
       <menu>
         <button value="cancel" class="btn">Cancel</button>
         <button value="create" class="btn primary" id="createBtn">Create</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Vault path dialog -->
+  <dialog id="vaultDialog">
+    <form method="dialog" id="vaultForm">
+      <h2>Obsidian Vault Path</h2>
+      <label>Vault folder
+        <span class="field">
+          <input name="vaultPath" required autocomplete="off" spellcheck="false" />
+          <button type="button" id="browseBtn" class="field-btn"
+                  title="Browse for folder…" aria-label="Browse for folder">…</button>
+        </span>
+      </label>
+      <p class="hint">Projects are stored in <code id="projectsDirHint"></code>.</p>
+      <menu>
+        <button value="cancel" class="btn">Cancel</button>
+        <button value="save" class="btn primary" id="vaultSaveBtn">Save</button>
       </menu>
     </form>
   </dialog>

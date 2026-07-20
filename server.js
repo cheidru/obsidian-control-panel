@@ -3,15 +3,139 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, execFile } = require('child_process');
 
 // --- Configuration ---------------------------------------------------------
-const ROOT = process.env.CONTROL_PANEL_DIR ||
-  'C:\\Users\\chei\\ObsidianVault\\control panel';
+const DEFAULT_VAULT_PATH = 'C:\\Users\\chei\\ObsidianVault';
+const PROJECTS_DIRNAME = 'control panel';
+const CONFIG_FILE = path.join(__dirname, 'config.json');
 const ARCHIVE_DIRNAME = '_archive';
 const META_FILENAME = 'project.md';
 const PORT = process.env.PORT || 4321;
 const PUBLIC_DIR = path.join(__dirname, 'public');
+
+// The projects folder lives inside the vault. CONTROL_PANEL_DIR, when set,
+// overrides it wholesale and makes the vault path read-only in the UI.
+const ROOT_OVERRIDE = process.env.CONTROL_PANEL_DIR || '';
+
+function readConfig() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    if (cfg && typeof cfg === 'object') return cfg;
+  } catch (e) {
+    // missing or malformed config falls back to defaults
+  }
+  return {};
+}
+
+function writeConfig(cfg) {
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2) + '\n');
+}
+
+let vaultPath = readConfig().vaultPath || DEFAULT_VAULT_PATH;
+
+// The projects root is re-derived whenever the vault path changes, so helpers
+// read it through this getter rather than capturing it once.
+function getRoot() {
+  return ROOT_OVERRIDE || path.join(vaultPath, PROJECTS_DIRNAME);
+}
+
+// --- Native folder picker --------------------------------------------------
+// The browser cannot reveal an absolute path, but the server runs on the same
+// machine, so it opens the real Windows folder dialog on the user's desktop.
+let pickerBusy = false;
+
+// Title of the browser window hosting the panel, matched as a substring so it
+// works across browsers ("Project Control Panel - Google Chrome", etc.).
+const PANEL_WINDOW_TITLE = 'Project Control Panel';
+
+function pickFolder(initialPath) {
+  const start = String(initialPath || '').replace(/'/g, "''");
+  const title = PANEL_WINDOW_TITLE.replace(/'/g, "''");
+
+  // Owning the dialog to the panel's own window makes the shell centre it over
+  // that window and keep it above it, instead of centring on the screen.
+  const ownerType = `
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public class PanelWindow : IWin32Window {
+  delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
+  [DllImport("user32.dll")] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+
+  IntPtr handle;
+  public IntPtr Handle { get { return handle; } }
+
+  public static IntPtr Find(string titlePart) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows(delegate(IntPtr h, IntPtr p) {
+      if (!IsWindowVisible(h)) return true;
+      StringBuilder sb = new StringBuilder(512);
+      GetWindowText(h, sb, 512);
+      if (sb.ToString().IndexOf(titlePart, StringComparison.OrdinalIgnoreCase) >= 0) {
+        found = h;
+        return false;
+      }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
+
+  public PanelWindow(string titlePart) {
+    // Fall back to whatever window is in front: the user just clicked the
+    // browse button there, so it is the panel window even if the tab title
+    // is not reflected in the window caption.
+    handle = Find(titlePart);
+    if (handle == IntPtr.Zero) handle = GetForegroundWindow();
+    if (handle != IntPtr.Zero) SetForegroundWindow(handle);
+  }
+}
+`.trim();
+
+  const script = [
+    // Add-Type emits progress records to stderr as CLIXML; silence them.
+    "$ProgressPreference = 'SilentlyContinue'",
+    // Emit UTF-8 so non-ASCII paths (e.g. Cyrillic) survive the pipe to Node,
+    // which decodes stdout as UTF-8. The console otherwise uses the OEM
+    // codepage (CP866 on a Russian Windows), which would arrive as mojibake.
+    '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
+    'Add-Type -AssemblyName System.Windows.Forms',
+    "Add-Type -ReferencedAssemblies 'System.Windows.Forms','System.Drawing' -TypeDefinition @'",
+    ownerType,
+    "'@",
+    `$owner = New-Object PanelWindow('${title}')`,
+    '$dlg = New-Object System.Windows.Forms.FolderBrowserDialog',
+    "$dlg.Description = 'Select your Obsidian vault folder'",
+    '$dlg.ShowNewFolderButton = $true',
+    `$dlg.SelectedPath = '${start}'`,
+    'if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dlg.SelectedPath) }',
+  ].join('\n');
+
+  // -EncodedCommand (UTF-16LE base64) sidesteps Windows command-line quoting,
+  // which mangles a multi-line script passed via -Command.
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+
+  return new Promise((resolve, reject) => {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-STA', '-EncodedCommand', encoded],
+      { timeout: 300000, encoding: 'utf8' },
+      (err, stdout) => {
+        // stderr is ignored on purpose: PowerShell routinely writes CLIXML
+        // progress noise there even when the dialog succeeds.
+        if (err) return reject(err);
+        const picked = String(stdout).trim();
+        resolve(picked || null); // null = user cancelled
+      }
+    );
+  });
+}
 
 // --- Minimal YAML frontmatter parsing --------------------------------------
 function parseFrontmatter(content) {
@@ -59,7 +183,7 @@ function stringifyFrontmatter(data, body) {
 
 // --- Project helpers -------------------------------------------------------
 function ensureRoot() {
-  fs.mkdirSync(ROOT, { recursive: true });
+  fs.mkdirSync(getRoot(), { recursive: true });
 }
 
 function sanitizeFolderName(name) {
@@ -71,7 +195,7 @@ function sanitizeFolderName(name) {
 }
 
 function metaPath(folder, archived) {
-  const base = archived ? path.join(ROOT, ARCHIVE_DIRNAME) : ROOT;
+  const base = archived ? path.join(getRoot(), ARCHIVE_DIRNAME) : getRoot();
   return path.join(base, folder, META_FILENAME);
 }
 
@@ -114,7 +238,7 @@ function writeProject(proj, archived) {
 }
 
 function listProjects(archived) {
-  const base = archived ? path.join(ROOT, ARCHIVE_DIRNAME) : ROOT;
+  const base = archived ? path.join(getRoot(), ARCHIVE_DIRNAME) : getRoot();
   if (!fs.existsSync(base)) return [];
   return fs
     .readdirSync(base, { withFileTypes: true })
@@ -174,6 +298,68 @@ async function handleApi(req, res, parts) {
   // parts: ['api', ...]
   const sub = parts[1];
 
+  if (sub === 'settings' && req.method === 'GET') {
+    return sendJSON(res, 200, {
+      vaultPath,
+      projectsDir: getRoot(),
+      projectsDirname: PROJECTS_DIRNAME,
+      locked: !!ROOT_OVERRIDE,
+    });
+  }
+
+  if (sub === 'browse-folder' && req.method === 'POST') {
+    if (process.platform !== 'win32') {
+      return sendJSON(res, 501, { error: 'Folder picker is only available on Windows' });
+    }
+    if (ROOT_OVERRIDE) {
+      return sendJSON(res, 409, {
+        error: 'Vault path is fixed by the CONTROL_PANEL_DIR environment variable',
+      });
+    }
+    if (pickerBusy) {
+      return sendJSON(res, 409, { error: 'A folder picker is already open' });
+    }
+    const body = await readBody(req);
+    pickerBusy = true;
+    try {
+      const picked = await pickFolder(body.initialPath || vaultPath);
+      return sendJSON(res, 200, { path: picked, cancelled: picked === null });
+    } catch (e) {
+      return sendJSON(res, 500, { error: 'Could not open folder picker: ' + (e.message || e) });
+    } finally {
+      pickerBusy = false;
+    }
+  }
+
+  if (sub === 'settings' && req.method === 'PUT') {
+    if (ROOT_OVERRIDE) {
+      return sendJSON(res, 409, {
+        error: 'Vault path is fixed by the CONTROL_PANEL_DIR environment variable',
+      });
+    }
+    const body = await readBody(req);
+    const next = String(body.vaultPath || '').trim().replace(/[\\/]+$/, '');
+    if (!next) return sendJSON(res, 400, { error: 'Vault path is required' });
+    if (!path.isAbsolute(next)) return sendJSON(res, 400, { error: 'Vault path must be absolute' });
+    let stat;
+    try {
+      stat = fs.statSync(next);
+    } catch (e) {
+      return sendJSON(res, 400, { error: 'Folder does not exist: ' + next });
+    }
+    if (!stat.isDirectory()) return sendJSON(res, 400, { error: 'Not a folder: ' + next });
+
+    vaultPath = next;
+    writeConfig({ ...readConfig(), vaultPath });
+    ensureRoot();
+    return sendJSON(res, 200, {
+      vaultPath,
+      projectsDir: getRoot(),
+      projectsDirname: PROJECTS_DIRNAME,
+      locked: false,
+    });
+  }
+
   if (sub === 'projects' && req.method === 'GET') {
     return sendJSON(res, 200, {
       active: listProjects(false),
@@ -186,7 +372,7 @@ async function handleApi(req, res, parts) {
     const name = (body.name || '').trim();
     if (!name) return sendJSON(res, 400, { error: 'Name is required' });
     const folder = sanitizeFolderName(name);
-    const dir = path.join(ROOT, folder);
+    const dir = path.join(getRoot(), folder);
     if (fs.existsSync(dir)) return sendJSON(res, 409, { error: 'A project with that name already exists' });
     const proj = {
       folder,
@@ -207,8 +393,8 @@ async function handleApi(req, res, parts) {
     const archived = req.url.includes('archived=1') || false;
 
     if (req.method === 'PUT' && !action) {
-      const existsActive = fs.existsSync(path.join(ROOT, folder));
-      const isArchived = !existsActive && fs.existsSync(path.join(ROOT, ARCHIVE_DIRNAME, folder));
+      const existsActive = fs.existsSync(path.join(getRoot(), folder));
+      const isArchived = !existsActive && fs.existsSync(path.join(getRoot(), ARCHIVE_DIRNAME, folder));
       if (!existsActive && !isArchived) return sendJSON(res, 404, { error: 'Project not found' });
       const proj = readProject(folder, isArchived);
       const body = await readBody(req);
@@ -221,18 +407,18 @@ async function handleApi(req, res, parts) {
     }
 
     if (req.method === 'POST' && action === 'archive') {
-      const from = path.join(ROOT, folder);
-      const to = path.join(ROOT, ARCHIVE_DIRNAME, folder);
+      const from = path.join(getRoot(), folder);
+      const to = path.join(getRoot(), ARCHIVE_DIRNAME, folder);
       if (!fs.existsSync(from)) return sendJSON(res, 404, { error: 'Project not found' });
-      fs.mkdirSync(path.join(ROOT, ARCHIVE_DIRNAME), { recursive: true });
+      fs.mkdirSync(path.join(getRoot(), ARCHIVE_DIRNAME), { recursive: true });
       if (fs.existsSync(to)) return sendJSON(res, 409, { error: 'Already archived' });
       fs.renameSync(from, to);
       return sendJSON(res, 200, { ok: true });
     }
 
     if (req.method === 'POST' && action === 'restore') {
-      const from = path.join(ROOT, ARCHIVE_DIRNAME, folder);
-      const to = path.join(ROOT, folder);
+      const from = path.join(getRoot(), ARCHIVE_DIRNAME, folder);
+      const to = path.join(getRoot(), folder);
       if (!fs.existsSync(from)) return sendJSON(res, 404, { error: 'Archived project not found' });
       if (fs.existsSync(to)) return sendJSON(res, 409, { error: 'A live project with that name exists' });
       fs.renameSync(from, to);
@@ -240,7 +426,7 @@ async function handleApi(req, res, parts) {
     }
 
     if (req.method === 'POST' && action === 'open') {
-      const base = archived ? path.join(ROOT, ARCHIVE_DIRNAME) : ROOT;
+      const base = archived ? path.join(getRoot(), ARCHIVE_DIRNAME) : getRoot();
       const dir = path.join(base, folder);
       if (!fs.existsSync(dir)) return sendJSON(res, 404, { error: 'Folder not found' });
       exec(`explorer "${dir}"`, () => {});
@@ -269,5 +455,5 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`\n  Control Panel running at  http://localhost:${PORT}`);
-  console.log(`  Projects folder:          ${ROOT}\n`);
+  console.log(`  Projects folder:          ${getRoot()}\n`);
 });
