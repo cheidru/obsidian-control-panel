@@ -5,6 +5,20 @@ const fs = require('fs');
 const path = require('path');
 const { exec, execFile } = require('child_process');
 
+// Resolve an absolute path to powershell.exe rather than relying on PATH.
+// If the server is launched from an environment whose PATH lacks
+// System32\WindowsPowerShell\v1.0, spawning bare 'powershell.exe' fails with
+// ENOENT. Fall back to the bare name only if the expected file is missing.
+const POWERSHELL_EXE = (() => {
+  const root = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
+  const full = path.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  try {
+    return fs.existsSync(full) ? full : 'powershell.exe';
+  } catch {
+    return 'powershell.exe';
+  }
+})();
+
 // --- Configuration ---------------------------------------------------------
 const DEFAULT_VAULT_PATH = 'C:\\Users\\chei\\ObsidianVault';
 const PROJECTS_DIRNAME = 'control panel';
@@ -14,6 +28,8 @@ const ARCHIVE_DIRNAME = '_archive';
 // Older projects used a fixed "project.md"; those are migrated on access.
 const LEGACY_META_FILENAME = 'project.md';
 const metaFilename = (folder) => `${folder}_info.md`;
+// A human-readable stats snapshot lives alongside it in "<folder>_stats.md".
+const statsFilename = (folder) => `${folder}_stats.md`;
 const PORT = process.env.PORT || 4321;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
@@ -126,7 +142,7 @@ public class PanelWindow : IWin32Window {
 
   return new Promise((resolve, reject) => {
     execFile(
-      'powershell.exe',
+      POWERSHELL_EXE,
       ['-NoProfile', '-STA', '-EncodedCommand', encoded],
       { timeout: 300000, encoding: 'utf8' },
       (err, stdout) => {
@@ -169,11 +185,33 @@ public class WinCtl {
   [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+  [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+  [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int pid);
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
 
-  static readonly IntPtr TOPMOST = new IntPtr(-1);
   static readonly IntPtr NOTOPMOST = new IntPtr(-2);
   const uint SWP_SHOW = 0x0040;
   const uint SWP_NOSIZE = 0x0001;
+  const byte VK_MENU = 0x12;          // ALT
+  const uint KEYEVENTF_KEYUP = 0x0002;
+
+  // Windows forbids a background process from calling SetForegroundWindow
+  // directly. Attaching our input queue to the current foreground thread and
+  // synthesising a stray ALT tap makes the OS treat the call as user-driven,
+  // which lets the target window actually come to the front.
+  static void ForceForeground(IntPtr h) {
+    uint pid;
+    uint fgThread = GetWindowThreadProcessId(GetForegroundWindow(), out pid);
+    uint ourThread = GetCurrentThreadId();
+    bool attached = fgThread != ourThread && AttachThreadInput(fgThread, ourThread, true);
+    keybd_event(VK_MENU, 0, 0, UIntPtr.Zero);
+    keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+    BringWindowToTop(h);
+    SetForegroundWindow(h);
+    if (attached) AttachThreadInput(fgThread, ourThread, false);
+  }
 
   public static IntPtr FindByTitle(string part) {
     IntPtr found = IntPtr.Zero;
@@ -207,10 +245,20 @@ public class WinCtl {
   // Move Obsidian to the panel's top-left and raise it to the front, WITHOUT
   // resizing (SWP_NOSIZE) — forcing a size fights Obsidian's own layout on load.
   public static void Place(IntPtr h, int x, int y) {
-    ShowWindow(h, 9); // SW_RESTORE (un-minimise)
-    // Topmost toggle raises it above the panel without needing foreground rights.
-    SetWindowPos(h, TOPMOST, x, y, 0, 0, SWP_SHOW | SWP_NOSIZE);
+    // Position first (keep Obsidian's own size).
     SetWindowPos(h, NOTOPMOST, x, y, 0, 0, SWP_SHOW | SWP_NOSIZE);
+    // Restoring from a minimised state is treated by the shell as a
+    // user-initiated activation, which reliably beats the foreground lock
+    // another app (e.g. the browser the panel runs in) is holding. The
+    // AttachThreadInput + ALT-tap trick alone does NOT: it leaves the note
+    // open but buried behind the browser, so the click looks like a no-op.
+    // The pause lets the minimise register before the restore, otherwise the
+    // two collapse into a no-op and no activation happens. The window returns
+    // to the position set just above.
+    ShowWindow(h, 6); // SW_MINIMIZE
+    System.Threading.Thread.Sleep(150);
+    ShowWindow(h, 9); // SW_RESTORE
+    System.Threading.Thread.Sleep(80);
     SetForegroundWindow(h);
   }
 }
@@ -227,6 +275,9 @@ public class WinCtl {
     '$r = New-Object WinCtl+RECT',
     '[void][WinCtl]::GetWindowRect($panel, [ref]$r)',
     '$x = $r.Left; $y = $r.Top',
+    // Permit any process (incl. an already-running Obsidian) to take foreground
+    // in response to the URI we are about to fire.
+    '[void][WinCtl]::AllowSetForegroundWindow(-1)',
     `Start-Process '${u}'`,
     // Wait for the Obsidian window (cold start can take a few seconds).
     '$obs = [IntPtr]::Zero',
@@ -242,7 +293,7 @@ public class WinCtl {
 
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
   execFile(
-    'powershell.exe',
+    POWERSHELL_EXE,
     ['-NoProfile', '-STA', '-EncodedCommand', encoded],
     { timeout: 30000 },
     (err) => { if (err) console.error('open note in Obsidian:', err.message); }
@@ -331,14 +382,19 @@ function readProject(folder, archived) {
   if (fs.existsSync(file)) {
     ({ data, body } = parseFrontmatter(fs.readFileSync(file, 'utf8')));
   }
+  const stats = readStats(folder, archived);
   return {
     folder,
     archived: !!archived,
     name: data.name || folder,
     start_date: data.start_date || '',
-    percent: clampPercent(data.percent),
+    // Progress and the extra stat fields are driven by "<folder>_stats.md",
+    // which is user-owned; fall back to the info file's percent only if the
+    // stats file has no Progress row yet.
+    percent: stats.progress.length ? stats.progress[0].percent : clampPercent(data.percent),
     status: data.status || 'Active',
     description: data.description || '',
+    stats: { progress: stats.progress, fields: stats.fields },
     _body: body,
   };
 }
@@ -360,6 +416,113 @@ function writeProject(proj, archived) {
     description: proj.description,
   };
   fs.writeFileSync(metaPath(proj.folder, archived), stringifyFrontmatter(data, proj._body));
+  ensureStats(proj, archived);
+}
+
+function statsPath(folder, archived) {
+  const base = archived ? path.join(getRoot(), ARCHIVE_DIRNAME) : getRoot();
+  return path.join(base, folder, statsFilename(folder));
+}
+
+// Parse a stats table into ordered { title, field, value } rows, skipping the
+// header and the "| --- | --- |" separator. Two layouts are accepted:
+//   | Title | Field | Value |   (current — title labels the progress bar)
+//   | Field | Value |           (legacy — no title column)
+function parseStatsTable(content) {
+  const rows = [];
+  for (const raw of content.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line.startsWith('|')) continue;
+    const cells = line.split('|').slice(1, -1).map((c) => c.trim());
+    if (cells.length < 2) continue;
+    // separator row like | --- | --- | --- |
+    if (cells.every((c) => c === '' || /^:?-{2,}:?$/.test(c))) continue;
+    // header row (either layout)
+    const lower = cells.map((c) => c.toLowerCase());
+    if (lower.includes('field') && lower.includes('value')) continue;
+    let title, field, value;
+    if (cells.length >= 3) {
+      [title, field, value] = cells;
+    } else {
+      title = '';
+      [field, value] = cells;
+    }
+    if (!field) continue;
+    rows.push({ title, field, value });
+  }
+  return rows;
+}
+
+// Read "<folder>_stats.md" as the source of truth for the card's progress
+// indicator(s) and its extra stat fields. Each "Progress" row drives one
+// progress bar whose label comes from that row's Title column (defaulting to
+// "Progress"); every other row is surfaced as a labelled field on the card.
+// A missing or unreadable file yields no progress bars and no fields.
+function readStats(folder, archived) {
+  const file = statsPath(folder, archived);
+  let rows = [];
+  if (fs.existsSync(file)) {
+    try {
+      rows = parseStatsTable(fs.readFileSync(file, 'utf8'));
+    } catch (e) {
+      // unreadable stats file: fall back to no override
+    }
+  }
+  // Rows already represented elsewhere on the card (the status badge, the
+  // start-date line) are not repeated as extra fields.
+  const BUILTIN = new Set(['status', 'start date']);
+  const progress = [];
+  const fields = [];
+  for (const r of rows) {
+    const key = r.field.toLowerCase();
+    if (key === 'progress') {
+      const n = parseInt(r.value, 10);
+      progress.push({
+        title: r.title || 'Progress',
+        percent: isNaN(n) ? 0 : Math.max(0, Math.min(100, n)),
+      });
+    } else if (!BUILTIN.has(key)) {
+      fields.push({ field: r.field, value: r.value });
+    }
+  }
+  return { progress, fields };
+}
+
+// A Markdown snapshot of the project's current stats. It is regenerated on
+// every save, so it always reflects the values shown in the panel.
+function renderStats(proj) {
+  return [
+    `# ${proj.name} — Stats`,
+    '',
+    `_Updated ${new Date().toISOString().slice(0, 10)}_`,
+    '',
+    '| Title | Field | Value |',
+    '| --- | --- | --- |',
+    `| Progress | Progress | ${clampPercent(proj.percent)}% |`,
+    `| | Status | ${proj.status || 'Active'} |`,
+    `| | Start date | ${proj.start_date || '—'} |`,
+    '',
+  ].join('\n');
+}
+
+// Create the stats file from the current project values only when it does not
+// already exist. Once created it is user-owned — the card reads its Progress
+// row and fields — so we never overwrite it and clobber manual edits.
+function ensureStats(proj, archived) {
+  const file = statsPath(proj.folder, archived);
+  if (fs.existsSync(file)) return;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, renderStats(proj));
+}
+
+// Create the stats file for any existing project that predates this feature,
+// without clobbering one that already exists (it may hold manual notes).
+function backfillStats() {
+  for (const archived of [false, true]) {
+    for (const proj of listProjects(archived)) {
+      ensureStats(proj, archived);
+    }
+  }
 }
 
 function listProjects(archived) {
@@ -574,6 +737,34 @@ async function handleApi(req, res, parts) {
       openNoteInObsidian(uri, folder);
       return sendJSON(res, 200, { ok: true, file, uri });
     }
+
+    // Open the project's stats file "<folder>_stats.md" in Obsidian, raising
+    // Obsidian over the panel window. Created from the current values first if
+    // it does not exist yet.
+    if (req.method === 'POST' && action === 'stats') {
+      const base = archived ? path.join(getRoot(), ARCHIVE_DIRNAME) : getRoot();
+      const dir = path.join(base, folder);
+      if (!fs.existsSync(dir)) return sendJSON(res, 404, { error: 'Folder not found' });
+      const file = statsPath(folder, archived);
+      if (!fs.existsSync(file)) ensureStats(readProject(folder, archived), archived);
+      const uri = 'obsidian://open?path=' + encodeURIComponent(file);
+      openNoteInObsidian(uri, `${folder}_stats`);
+      return sendJSON(res, 200, { ok: true, file, uri });
+    }
+
+    // Open the project's metadata file "<folder>_info.md" in Obsidian, raising
+    // Obsidian over the panel window. Created from the current values first if
+    // it does not exist yet.
+    if (req.method === 'POST' && action === 'info') {
+      const base = archived ? path.join(getRoot(), ARCHIVE_DIRNAME) : getRoot();
+      const dir = path.join(base, folder);
+      if (!fs.existsSync(dir)) return sendJSON(res, 404, { error: 'Folder not found' });
+      const file = metaPath(folder, archived);
+      if (!fs.existsSync(file)) writeProject(readProject(folder, archived), archived);
+      const uri = 'obsidian://open?path=' + encodeURIComponent(file);
+      openNoteInObsidian(uri, `${folder}_info`);
+      return sendJSON(res, 200, { ok: true, file, uri });
+    }
   }
 
   return sendJSON(res, 404, { error: 'Unknown endpoint' });
@@ -581,6 +772,7 @@ async function handleApi(req, res, parts) {
 
 // --- Server ----------------------------------------------------------------
 ensureRoot();
+backfillStats();
 
 const server = http.createServer((req, res) => {
   const urlPath = req.url.split('?')[0];

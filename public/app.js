@@ -97,11 +97,8 @@ function card(p) {
       <select class="badge ${badgeClass(p.status)}" title="Change status">${statusOptions}</select>
     </div>
     <p class="desc"></p>
-    <div class="progress-row">
-      <div class="bar"><span style="width:${p.percent}%"></span></div>
-      <span class="pct">${p.percent}%</span>
-    </div>
-    <input class="range" type="range" min="0" max="100" value="${p.percent}" ${p.archived ? 'disabled' : ''} />
+    <div class="progress-list"></div>
+    <dl class="stats-fields"></dl>
     <div class="card-actions"></div>
   `;
 
@@ -109,11 +106,45 @@ function card(p) {
   el.querySelector('.card-date').textContent = fmtDate(p.start_date);
   el.querySelector('.desc').textContent = p.description || '';
 
+  // One progress bar per "Progress" row in "<folder>_stats.md". Its title comes
+  // from that row's Title column (read-only); fall back to a single bar if the
+  // stats file has no Progress row.
+  const progressList = el.querySelector('.progress-list');
+  let progress = (p.stats && p.stats.progress) || [];
+  if (!progress.length) progress = [{ title: 'Progress', percent: p.percent || 0 }];
+  for (const { title, percent } of progress) {
+    const item = document.createElement('div');
+    item.className = 'progress-item';
+    const label = document.createElement('div');
+    label.className = 'progress-title';
+    label.textContent = title;
+    const row = document.createElement('div');
+    row.className = 'progress-row';
+    row.innerHTML = '<div class="bar"><span></span></div><span class="pct"></span>';
+    row.querySelector('.bar > span').style.width = percent + '%';
+    row.querySelector('.pct').textContent = percent + '%';
+    item.append(label, row);
+    progressList.append(item);
+  }
+
+  // Extra stat fields (e.g. "Everyday work to be done") come from the project's
+  // "<folder>_stats.md" file, which the user maintains.
+  const statsWrap = el.querySelector('.stats-fields');
+  const fields = (p.stats && p.stats.fields) || [];
+  for (const { field, value } of fields) {
+    const dt = document.createElement('dt');
+    dt.textContent = field;
+    const dd = document.createElement('dd');
+    dd.textContent = value;
+    statsWrap.append(dt, dd);
+  }
+  if (!fields.length) statsWrap.hidden = true;
+
   // Clicking the card box (anywhere outside its interactive controls) opens the
   // project's main note "<folder>.md" in its default app.
   el.title = 'Open note';
   el.addEventListener('click', async (e) => {
-    if (e.target.closest('button, select, input, textarea, .desc')) return;
+    if (e.target.closest('button, select, input, textarea, .card-title')) return;
     try {
       await api('POST', `/api/project/${encodeURIComponent(p.folder)}/note?archived=${p.archived ? 1 : 0}`);
       toast('Opening in Obsidian…');
@@ -131,33 +162,19 @@ function card(p) {
     toast('Status updated');
   });
 
-  // percent slider
-  const range = el.querySelector('.range');
-  const fill = el.querySelector('.bar > span');
-  const pctLabel = el.querySelector('.pct');
-  range.addEventListener('input', () => {
-    fill.style.width = range.value + '%';
-    pctLabel.textContent = range.value + '%';
-  });
-  range.addEventListener('change', () => {
-    p.percent = +range.value;
-    debouncedSave(p.folder, p.archived, { percent: +range.value });
-    toast('Progress saved');
-  });
-
-  // description: click to edit
-  const desc = el.querySelector('.desc');
-  if (!p.archived) {
-    desc.title = 'Click to edit';
-    desc.style.cursor = 'text';
-    desc.addEventListener('click', () => editDescription(p, desc));
-  }
-
   // actions
   const actions = el.querySelector('.card-actions');
-  actions.appendChild(button('Open folder', 'btn small ghost', async () => {
-    try { await api('POST', `/api/project/${encodeURIComponent(p.folder)}/open?archived=${p.archived ? 1 : 0}`); }
-    catch (e) { toast(e.message, true); }
+  actions.appendChild(button('Stats', 'btn small ghost', async () => {
+    try {
+      await api('POST', `/api/project/${encodeURIComponent(p.folder)}/stats?archived=${p.archived ? 1 : 0}`);
+      toast('Opening stats in Obsidian…');
+    } catch (e) { toast(e.message, true); }
+  }));
+  actions.appendChild(button('Info', 'btn small ghost', async () => {
+    try {
+      await api('POST', `/api/project/${encodeURIComponent(p.folder)}/info?archived=${p.archived ? 1 : 0}`);
+      toast('Opening info in Obsidian…');
+    } catch (e) { toast(e.message, true); }
   }));
 
   if (p.archived) {
@@ -181,33 +198,6 @@ function button(label, cls, onClick) {
   b.textContent = label;
   b.addEventListener('click', onClick);
   return b;
-}
-
-function editDescription(p, descEl) {
-  const ta = document.createElement('textarea');
-  ta.value = p.description || '';
-  ta.rows = 3;
-  ta.maxLength = 500;
-  ta.style.cssText = 'width:100%;font:inherit;background:var(--bg);color:var(--text);border:1px solid var(--accent);border-radius:8px;padding:8px;resize:vertical;';
-  descEl.replaceWith(ta);
-  ta.focus();
-  const commit = () => {
-    p.description = ta.value;
-    const newDesc = document.createElement('p');
-    newDesc.className = 'desc';
-    newDesc.textContent = ta.value;
-    newDesc.title = 'Click to edit';
-    newDesc.style.cursor = 'text';
-    newDesc.addEventListener('click', () => editDescription(p, newDesc));
-    ta.replaceWith(newDesc);
-    debouncedSave(p.folder, false, { description: ta.value });
-    toast('Description saved');
-  };
-  ta.addEventListener('blur', commit);
-  ta.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); ta.blur(); }
-    if (e.key === 'Escape') { ta.value = p.description || ''; ta.blur(); }
-  });
 }
 
 function render() {

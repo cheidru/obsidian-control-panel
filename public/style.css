@@ -153,8 +153,11 @@ dialog .field input:focus { outline: none; }
 }
 .card { cursor: pointer; }
 .card:hover { border-color: #3a4757; }
-.card:hover .card-title { text-decoration: underline; }
 .card.archived { opacity: .72; }
+
+/* The title itself is not a click target (the card body opens the note), so it
+   shows the default cursor rather than the card's pointer. */
+.card-title { cursor: default; }
 
 .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
 .card-title { font-size: 16px; font-weight: 600; margin: 0; word-break: break-word; }
@@ -177,12 +180,23 @@ dialog .field input:focus { outline: none; }
 .desc { font-size: 13px; color: var(--muted); margin: 0; white-space: pre-wrap; word-break: break-word; }
 .desc:empty::before { content: "No description"; opacity: .5; }
 
+.progress-list { display: flex; flex-direction: column; gap: 10px; }
+.progress-item { display: flex; flex-direction: column; gap: 4px; }
+.progress-title { font-size: 12px; color: var(--muted); }
 .progress-row { display: flex; align-items: center; gap: 10px; }
 .bar { flex: 1; height: 8px; background: var(--panel-2); border-radius: 999px; overflow: hidden; }
 .bar > span { display: block; height: 100%; background: linear-gradient(90deg, var(--accent-2), var(--accent)); transition: width .2s; }
 .pct { font-variant-numeric: tabular-nums; font-size: 13px; width: 38px; text-align: right; color: var(--text); }
 
-.range { width: 100%; accent-color: var(--accent); cursor: pointer; }
+.stats-fields {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+.stats-fields dt { color: var(--muted); }
+.stats-fields dd { margin: 0; color: var(--text); word-break: break-word; }
 
 .card-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 2px; }
 
